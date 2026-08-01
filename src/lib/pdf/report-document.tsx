@@ -21,7 +21,8 @@ const styles = StyleSheet.create({
   page: { padding: 28, fontSize: 8, fontFamily: "Noto Sans" },
   title: { fontSize: 14, fontWeight: 700, marginBottom: 2 },
   subtitle: { fontSize: 9, color: "#333", marginBottom: 2 },
-  meta: { fontSize: 9, color: "#333", marginBottom: 10 },
+  meta: { fontSize: 9, color: "#333", marginBottom: 2 },
+  odometerLine: { fontSize: 10, fontWeight: 700, marginBottom: 10 },
   table: { borderWidth: 1, borderColor: BORDER_COLOR },
   headerRow: {
     flexDirection: "row",
@@ -73,9 +74,14 @@ export function ReportDocument(props: ReportDocumentProps) {
         )}
         <Text style={styles.meta}>
           Zakres: {props.zakresOd} – {props.zakresDo}
-          {props.stanPoczatkowy !== null && ` · Stan licznika na początek: ${props.stanPoczatkowy} km`}
-          {props.stanKoncowy !== null && ` · Stan licznika na koniec: ${props.stanKoncowy} km`}
         </Text>
+        {(props.stanPoczatkowy !== null || props.stanKoncowy !== null) && (
+          <Text style={styles.odometerLine}>
+            Stan licznika na początek okresu: {props.stanPoczatkowy !== null ? `${props.stanPoczatkowy} km` : "—"}
+            {"  ·  "}
+            Stan licznika na koniec okresu: {props.stanKoncowy !== null ? `${props.stanKoncowy} km` : "—"}
+          </Text>
+        )}
 
         <View style={styles.table}>
           <View style={styles.headerRow}>
