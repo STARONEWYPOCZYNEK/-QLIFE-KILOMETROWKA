@@ -2,13 +2,13 @@ import { describe, expect, it } from "vitest";
 import { businessDaysInRange, generateAutoTrips, type RouteOption } from "./engine";
 
 const ROUTES: RouteOption[] = [
-  { locationId: "strupin", nazwa: "Strupin Duży 93", cel: "Nadzór budowy", oneWayKm: 6.0, waga: 5 },
-  { locationId: "wlodawska", nazwa: "Włodawska 7", cel: "Myjnia", oneWayKm: 3.0, waga: 5 },
-  { locationId: "hurtownia1", nazwa: "Lwowska 105", cel: "Zakup materiałów", oneWayKm: 4.0, waga: 3 },
-  { locationId: "hurtownia2", nazwa: "Hrubieszowska 54", cel: "Zakup materiałów", oneWayKm: 4.0, waga: 3 },
-  { locationId: "bank1", nazwa: "Lubelska 11", cel: "Obsługa bankowa", oneWayKm: 3.0, waga: 2 },
-  { locationId: "warszawa", nazwa: "Warszawa", cel: "Spotkanie inwestycyjne", oneWayKm: 245.0, waga: 1 },
-  { locationId: "nerta", nazwa: "Nerta Kostrzyn", cel: "Spotkanie handlowe", oneWayKm: 490.0, waga: 1 },
+  { locationId: "strupin", nazwa: "Strupin Duży 93", cel: "Nadzór budowy", oneWayKm: 6.0, waga: 5, tier: 1 },
+  { locationId: "wlodawska", nazwa: "Włodawska 7", cel: "Myjnia", oneWayKm: 3.0, waga: 5, tier: 1 },
+  { locationId: "hurtownia1", nazwa: "Lwowska 105", cel: "Zakup materiałów", oneWayKm: 4.0, waga: 3, tier: 3 },
+  { locationId: "hurtownia2", nazwa: "Hrubieszowska 54", cel: "Zakup materiałów", oneWayKm: 4.0, waga: 3, tier: 3 },
+  { locationId: "bank1", nazwa: "Lubelska 11", cel: "Obsługa bankowa", oneWayKm: 3.0, waga: 2, tier: 3 },
+  { locationId: "warszawa", nazwa: "Warszawa", cel: "Spotkanie inwestycyjne", oneWayKm: 245.0, waga: 1, tier: 2 },
+  { locationId: "nerta", nazwa: "Nerta Kostrzyn", cel: "Spotkanie handlowe", oneWayKm: 490.0, waga: 1, tier: 3 },
 ];
 
 function sumKm(trips: { km: number }[]): number {
@@ -16,12 +16,11 @@ function sumKm(trips: { km: number }[]): number {
 }
 
 describe("businessDaysInRange", () => {
-  it("wyklucza weekendy gdy workdaysOnly=true", () => {
-    // styczeń 2026: 1 stycznia to czwartek
+  it("wyklucza tylko niedziele gdy workdaysOnly=true (pon-sob to dni robocze QLIFE)", () => {
+    // styczeń 2026: 3 stycznia to sobota, 4 stycznia to niedziela
     const days = businessDaysInRange("2026-01-01", "2026-01-31", true);
-    expect(days).not.toContain("2026-01-03"); // sobota
-    expect(days).not.toContain("2026-01-04"); // niedziela
-    expect(days.length).toBeGreaterThan(19);
+    expect(days).toContain("2026-01-03"); // sobota - jest dniem z dojazdami
+    expect(days).not.toContain("2026-01-04"); // niedziela - wykluczona
   });
 
   it("obejmuje wszystkie dni gdy workdaysOnly=false", () => {
@@ -55,6 +54,32 @@ describe("generateAutoTrips", () => {
       });
       expect(sumKm(result.trips) + result.unresolvedKm).toBeCloseTo(target, 5);
     }
+  });
+
+  it("przy małym celu używa najpierw tras warstwy 1 (myjnia/budowa), nie od razu Warszawy/hurtowni", () => {
+    const result = generateAutoTrips({
+      periodStart: "2026-01-01",
+      periodEnd: "2026-01-31",
+      targetKm: 100, // mały cel - powinien zmieścić się w samych trasach codziennych
+      routes: ROUTES,
+      baseName: "Kopernika 34",
+    });
+    const usedLocations = new Set(result.trips.map((t) => (t.dokad === "Kopernika 34" ? t.skad : t.dokad)));
+    expect(usedLocations.has("Warszawa")).toBe(false);
+    expect(usedLocations.has("Nerta Kostrzyn")).toBe(false);
+  });
+
+  it("sięga po Warszawę (warstwa 2) dopiero gdy same trasy codzienne nie pokryją celu", () => {
+    // 31 dni * maks. 4 przejazdy/dzień * (2x6km lub 2x3km) daje maksymalnie ok. 1400 km z samej warstwy 1
+    const result = generateAutoTrips({
+      periodStart: "2026-01-01",
+      periodEnd: "2026-01-31",
+      targetKm: 5000,
+      routes: ROUTES,
+      baseName: "Kopernika 34",
+    });
+    const usedLocations = new Set(result.trips.map((t) => (t.dokad === "Kopernika 34" ? t.skad : t.dokad)));
+    expect(usedLocations.has("Warszawa")).toBe(true);
   });
 
   it("gdy nie da się dopasować dokładnie, oznacza resztę WYMAGA WYBORU CELU zamiast zgubić różnicę", () => {

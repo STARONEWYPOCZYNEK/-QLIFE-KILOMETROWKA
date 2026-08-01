@@ -10,6 +10,9 @@ import type { AppSettingsRow, LocationRow, ReportingPeriodRow } from "@/lib/data
 
 type ActionResult = { error: string } | { success: true };
 
+/** Tymczasowe, gwarantowane unikalne w obrębie jednego inserta numery — renumberTrips ustawia właściwe zaraz potem. */
+const PLACEHOLDER_NUMER_WPISU_BASE = 1_000_000;
+
 function revalidate(periodId: string) {
   revalidatePath(`/panel/okresy/${periodId}`);
   revalidatePath("/panel/okresy");
@@ -162,9 +165,9 @@ export async function recordEndOdometerAndGenerate(periodId: string, endKm: numb
 
   if (generated.length > 0) {
     const { error: insertError } = await supabase.from("trips").insert(
-      generated.map((t) => ({
+      generated.map((t, index) => ({
         reporting_period_id: periodId,
-        numer_wpisu: 999999,
+        numer_wpisu: PLACEHOLDER_NUMER_WPISU_BASE + index,
         data: t.data,
         skad: t.skad,
         dokad: t.dokad,
@@ -232,9 +235,9 @@ export async function addExtraAutoFill(periodId: string): Promise<ActionResult> 
   if (generated.length === 0) return { error: "Nie udało się dopasować pozostałych kilometrów" };
 
   const { error } = await supabase.from("trips").insert(
-    generated.map((t) => ({
+    generated.map((t, index) => ({
       reporting_period_id: periodId,
-      numer_wpisu: 999999,
+      numer_wpisu: PLACEHOLDER_NUMER_WPISU_BASE + index,
       data: t.data,
       skad: t.skad,
       dokad: t.dokad,

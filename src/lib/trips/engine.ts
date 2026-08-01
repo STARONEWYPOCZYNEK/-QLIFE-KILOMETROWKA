@@ -4,6 +4,8 @@ export interface RouteOption {
   cel: string;
   oneWayKm: number;
   waga: number;
+  /** 1 = codzienna trasa (myjnia/budowa), 2 = eskalacja (Warszawa), 3 = sporadyczne (hurtownie/banki/LR/Nerta). */
+  tier: 1 | 2 | 3;
 }
 
 export interface GeneratedTripDraft {
@@ -23,6 +25,7 @@ export interface AutoFillInput {
   targetKm: number;
   routes: RouteOption[];
   baseName: string;
+  /** Gdy true (domyślnie): pon-sob, wyklucza tylko niedzielę. */
   workdaysOnly?: boolean;
   maxTripsPerDay?: number;
   /** Dates (ISO) already used by manually-entered trips — avoided when picking auto days if possible. */
@@ -50,13 +53,14 @@ function toIsoDate(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
+/** workdaysOnly=true wyklucza tylko niedzielę (pon-sob to dni z dojazdami) — zgodnie z realnym wzorcem QLIFE. */
 export function businessDaysInRange(startIso: string, endIso: string, workdaysOnly = true): string[] {
   const start = new Date(`${startIso}T00:00:00Z`);
   const end = new Date(`${endIso}T00:00:00Z`);
   const days: string[] = [];
   for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
-    const dayOfWeek = d.getUTCDay(); // 0 = niedziela, 6 = sobota
-    if (workdaysOnly && (dayOfWeek === 0 || dayOfWeek === 6)) continue;
+    const dayOfWeek = d.getUTCDay(); // 0 = niedziela
+    if (workdaysOnly && dayOfWeek === 0) continue;
     days.push(toIsoDate(d));
   }
   return days;
@@ -99,6 +103,87 @@ function findExactCombination(
   return search(targetTenths, 0, 0);
 }
 
+interface DayConstraint {
+  counts: Map<string, number>;
+  cap: number;
+}
+
+function findDayWithCapacity(dayPool: string[], constraints: DayConstraint[], startCursor: number): string | null {
+  for (let i = 0; i < dayPool.length; i++) {
+    const day = dayPool[(startCursor + i) % dayPool.length];
+    if (constraints.every((c) => (c.counts.get(day) ?? 0) < c.cap)) return day;
+  }
+  return null;
+}
+
+interface FillState {
+  trips: GeneratedTripDraft[];
+  remainingTenths: number;
+  overallCounts: Map<string, number>;
+  tier1Counts: Map<string, number>;
+  dayCursor: number;
+}
+
+/**
+ * Wypełnia jedną warstwę priorytetu aż zabraknie miejsca w dniach albo reszta będzie za mała.
+ * Warstwa 1 (codzienne dojazdy myjnia/budowa) jest dodatkowo ograniczona do jednego przejazdu
+ * dziennie — inaczej sama zajęłaby wszystkie dostępne "sloty" w dniach, nie zostawiając miejsca
+ * na eskalację do Warszawy/hurtowni gdy cel jest duży.
+ */
+function fillTier(
+  state: FillState,
+  tierRoutes: RouteOption[],
+  dayPool: string[],
+  baseName: string,
+  maxTripsPerDay: number,
+  isDailyTier: boolean,
+  rng: () => number,
+): void {
+  if (tierRoutes.length === 0 || dayPool.length === 0) return;
+
+  const constraints: DayConstraint[] = [{ counts: state.overallCounts, cap: maxTripsPerDay }];
+  if (isDailyTier) constraints.push({ counts: state.tier1Counts, cap: 1 });
+
+  const smallestPairTenths = Math.min(...tierRoutes.map((r) => toTenths(r.oneWayKm) * 2));
+  const guardLimit = dayPool.length * maxTripsPerDay + 200;
+  let guard = 0;
+
+  while (state.remainingTenths >= smallestPairTenths && guard < guardLimit) {
+    guard += 1;
+    const route = pickWeighted(tierRoutes, rng);
+    const pairTenths = toTenths(route.oneWayKm) * 2;
+    if (pairTenths > state.remainingTenths) continue;
+
+    const day = findDayWithCapacity(dayPool, constraints, state.dayCursor);
+    if (!day) break; // wszystkie dni w tej warstwie osiągnęły limit — przejdź do kolejnej warstwy
+    state.dayCursor = (dayPool.indexOf(day) + 1) % dayPool.length;
+
+    state.overallCounts.set(day, (state.overallCounts.get(day) ?? 0) + 1);
+    if (isDailyTier) state.tier1Counts.set(day, (state.tier1Counts.get(day) ?? 0) + 1);
+    state.trips.push({
+      data: day,
+      skad: baseName,
+      dokad: route.nazwa,
+      cel: route.cel,
+      km: route.oneWayKm,
+      zrodlo: "auto",
+      wymagaWyboruCelu: false,
+      locationId: route.locationId,
+    });
+    state.trips.push({
+      data: day,
+      skad: route.nazwa,
+      dokad: baseName,
+      cel: route.cel,
+      km: route.oneWayKm,
+      zrodlo: "auto",
+      wymagaWyboruCelu: false,
+      locationId: route.locationId,
+    });
+    state.remainingTenths -= pairTenths;
+  }
+}
+
 export function generateAutoTrips(input: AutoFillInput): AutoFillResult {
   const {
     periodStart,
@@ -112,69 +197,41 @@ export function generateAutoTrips(input: AutoFillInput): AutoFillResult {
     rng = Math.random,
   } = input;
 
-  const trips: GeneratedTripDraft[] = [];
-  let remainingTenths = toTenths(targetKm);
-  if (remainingTenths <= 0 || routes.length === 0) {
-    return { trips, unresolvedKm: fromTenths(Math.max(remainingTenths, 0)) };
+  const state: FillState = {
+    trips: [],
+    remainingTenths: toTenths(targetKm),
+    overallCounts: new Map(),
+    tier1Counts: new Map(),
+    dayCursor: 0,
+  };
+  if (state.remainingTenths <= 0 || routes.length === 0) {
+    return { trips: state.trips, unresolvedKm: fromTenths(Math.max(state.remainingTenths, 0)) };
   }
 
   const allDays = businessDaysInRange(periodStart, periodEnd, workdaysOnly);
   if (allDays.length === 0) {
-    return { trips, unresolvedKm: fromTenths(remainingTenths) };
+    return { trips: state.trips, unresolvedKm: fromTenths(state.remainingTenths) };
   }
 
   const freeDays = allDays.filter((d) => !occupiedDates.includes(d));
   const dayPool = freeDays.length > 0 ? freeDays : allDays;
-  const tripsPerDay = new Map<string, number>();
 
-  const smallestPairTenths = Math.min(...routes.map((r) => toTenths(r.oneWayKm) * 2));
+  const tier1 = routes.filter((r) => r.tier === 1);
+  const tier2 = routes.filter((r) => r.tier === 2);
+  const tier3 = routes.filter((r) => r.tier === 3);
 
-  let dayCursor = 0;
-  let guard = 0;
-  const guardLimit = dayPool.length * maxTripsPerDay + 1000;
+  fillTier(state, tier1, dayPool, baseName, maxTripsPerDay, true, rng);
+  fillTier(state, tier2, dayPool, baseName, maxTripsPerDay, false, rng);
+  fillTier(state, tier3, dayPool, baseName, maxTripsPerDay, false, rng);
 
-  while (remainingTenths >= smallestPairTenths && guard < guardLimit) {
-    guard += 1;
-    const route = pickWeighted(routes, rng);
-    const pairTenths = toTenths(route.oneWayKm) * 2;
-    if (pairTenths > remainingTenths) continue;
-
-    const day = findDayWithCapacity(dayPool, tripsPerDay, maxTripsPerDay, dayCursor);
-    if (!day) break; // wszystkie dni osiągnęły limit
-    dayCursor = (dayPool.indexOf(day) + 1) % dayPool.length;
-
-    tripsPerDay.set(day, (tripsPerDay.get(day) ?? 0) + 1);
-    trips.push({
-      data: day,
-      skad: baseName,
-      dokad: route.nazwa,
-      cel: route.cel,
-      km: route.oneWayKm,
-      zrodlo: "auto",
-      wymagaWyboruCelu: false,
-      locationId: route.locationId,
-    });
-    trips.push({
-      data: day,
-      skad: route.nazwa,
-      dokad: baseName,
-      cel: route.cel,
-      km: route.oneWayKm,
-      zrodlo: "auto",
-      wymagaWyboruCelu: false,
-      locationId: route.locationId,
-    });
-    remainingTenths -= pairTenths;
-  }
-
-  if (remainingTenths > 0) {
+  if (state.remainingTenths > 0) {
     const legsTenths = routes.map((r) => toTenths(r.oneWayKm));
-    const combo = findExactCombination(legsTenths, remainingTenths, 3);
+    const combo = findExactCombination(legsTenths, state.remainingTenths, 3);
     if (combo && combo.length > 0) {
       const lastDay = dayPool[dayPool.length - 1];
       for (const legTenths of combo) {
         const route = routes.find((r) => toTenths(r.oneWayKm) === legTenths)!;
-        trips.push({
+        state.trips.push({
           data: lastDay,
           skad: baseName,
           dokad: route.nazwa,
@@ -185,37 +242,24 @@ export function generateAutoTrips(input: AutoFillInput): AutoFillResult {
           locationId: route.locationId,
         });
       }
-      remainingTenths = 0;
+      state.remainingTenths = 0;
     }
   }
 
-  if (remainingTenths > 0) {
+  if (state.remainingTenths > 0) {
     const lastDay = allDays[allDays.length - 1];
-    trips.push({
+    state.trips.push({
       data: lastDay,
       skad: baseName,
       dokad: "(do ustalenia)",
       cel: "WYMAGA WYBORU CELU",
-      km: fromTenths(remainingTenths),
+      km: fromTenths(state.remainingTenths),
       zrodlo: "auto",
       wymagaWyboruCelu: true,
       locationId: null,
     });
-    remainingTenths = 0;
+    state.remainingTenths = 0;
   }
 
-  return { trips, unresolvedKm: 0 };
-}
-
-function findDayWithCapacity(
-  dayPool: string[],
-  tripsPerDay: Map<string, number>,
-  maxTripsPerDay: number,
-  startCursor: number,
-): string | null {
-  for (let i = 0; i < dayPool.length; i++) {
-    const day = dayPool[(startCursor + i) % dayPool.length];
-    if ((tripsPerDay.get(day) ?? 0) < maxTripsPerDay) return day;
-  }
-  return null;
+  return { trips: state.trips, unresolvedKm: 0 };
 }
