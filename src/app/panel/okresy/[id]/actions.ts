@@ -13,6 +13,15 @@ type ActionResult = { error: string } | { success: true };
 /** Tymczasowe, gwarantowane unikalne w obrębie jednego inserta numery — renumberTrips ustawia właściwe zaraz potem. */
 const PLACEHOLDER_NUMER_WPISU_BASE = 1_000_000;
 
+/**
+ * `now()` w Postgresie zwraca tę samą wartość dla wszystkich wierszy jednego inserta, więc bez tego
+ * `renumberTrips` (sortujące po data, created_at) nie miałoby jak odróżnić kolejności generowania —
+ * wpisy tego samego dnia wychodziłyby w przypadkowej kolejności zamiast pary wyjazd/powrót obok siebie.
+ */
+function explicitCreatedAt(index: number): string {
+  return new Date(Date.now() + index).toISOString();
+}
+
 function revalidate(periodId: string) {
   revalidatePath(`/panel/okresy/${periodId}`);
   revalidatePath("/panel/okresy");
@@ -168,6 +177,7 @@ export async function recordEndOdometerAndGenerate(periodId: string, endKm: numb
       generated.map((t, index) => ({
         reporting_period_id: periodId,
         numer_wpisu: PLACEHOLDER_NUMER_WPISU_BASE + index,
+        created_at: explicitCreatedAt(index),
         data: t.data,
         skad: t.skad,
         dokad: t.dokad,
@@ -238,6 +248,7 @@ export async function addExtraAutoFill(periodId: string): Promise<ActionResult> 
     generated.map((t, index) => ({
       reporting_period_id: periodId,
       numer_wpisu: PLACEHOLDER_NUMER_WPISU_BASE + index,
+      created_at: explicitCreatedAt(index),
       data: t.data,
       skad: t.skad,
       dokad: t.dokad,

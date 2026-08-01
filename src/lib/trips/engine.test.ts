@@ -8,7 +8,8 @@ const ROUTES: RouteOption[] = [
   { locationId: "hurtownia2", nazwa: "Hrubieszowska 54", cel: "Zakup materiałów", oneWayKm: 4.0, waga: 3, tier: 3 },
   { locationId: "bank1", nazwa: "Lubelska 11", cel: "Obsługa bankowa", oneWayKm: 3.0, waga: 2, tier: 3 },
   { locationId: "warszawa", nazwa: "Warszawa", cel: "Spotkanie inwestycyjne", oneWayKm: 245.0, waga: 1, tier: 2 },
-  { locationId: "nerta", nazwa: "Nerta Kostrzyn", cel: "Spotkanie handlowe", oneWayKm: 490.0, waga: 1, tier: 3 },
+  { locationId: "nerta", nazwa: "Nerta Kostrzyn", cel: "Spotkanie handlowe", oneWayKm: 490.0, waga: 1, tier: 4 },
+  { locationId: "lr", nazwa: "LR Katowice", cel: "Szkolenie", oneWayKm: 360.0, waga: 1, tier: 4 },
 ];
 
 function sumKm(trips: { km: number }[]): number {
@@ -80,6 +81,43 @@ describe("generateAutoTrips", () => {
     });
     const usedLocations = new Set(result.trips.map((t) => (t.dokad === "Kopernika 34" ? t.skad : t.dokad)));
     expect(usedLocations.has("Warszawa")).toBe(true);
+  });
+
+  it("zachowuje co najmniej tygodniowy odstęp między kolejnymi dalekimi wyjazdami (Warszawa)", () => {
+    const result = generateAutoTrips({
+      periodStart: "2026-01-01",
+      periodEnd: "2026-01-31",
+      targetKm: 2000, // wymusza kilka wyjazdów do Warszawy, nie tylko jeden
+      routes: ROUTES,
+      baseName: "Kopernika 34",
+    });
+    const warsawDates = [
+      ...new Set(
+        result.trips.filter((t) => t.dokad === "Warszawa" || t.skad === "Warszawa").map((t) => t.data),
+      ),
+    ].sort();
+    for (let i = 1; i < warsawDates.length; i++) {
+      const gapDays =
+        (new Date(warsawDates[i]).getTime() - new Date(warsawDates[i - 1]).getTime()) / 86_400_000;
+      expect(gapDays).toBeGreaterThanOrEqual(7);
+    }
+  });
+
+  it("dzień z dalekim wyjazdem nie miesza się z innymi trasami tego samego dnia", () => {
+    const result = generateAutoTrips({
+      periodStart: "2026-01-01",
+      periodEnd: "2026-01-31",
+      targetKm: 2000,
+      routes: ROUTES,
+      baseName: "Kopernika 34",
+    });
+    const warsawDays = new Set(
+      result.trips.filter((t) => t.dokad === "Warszawa" || t.skad === "Warszawa").map((t) => t.data),
+    );
+    for (const day of warsawDays) {
+      const tripsThatDay = result.trips.filter((t) => t.data === day);
+      expect(tripsThatDay.every((t) => t.dokad === "Warszawa" || t.skad === "Warszawa")).toBe(true);
+    }
   });
 
   it("gdy nie da się dopasować dokładnie, oznacza resztę WYMAGA WYBORU CELU zamiast zgubić różnicę", () => {

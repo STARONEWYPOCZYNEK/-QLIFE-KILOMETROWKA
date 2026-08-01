@@ -4,8 +4,13 @@ export interface RouteOption {
   cel: string;
   oneWayKm: number;
   waga: number;
-  /** 1 = codzienna trasa (myjnia/budowa), 2 = eskalacja (Warszawa), 3 = sporadyczne (hurtownie/banki/LR/Nerta). */
-  tier: 1 | 2 | 3;
+  /**
+   * 1 = codzienna trasa (myjnia/budowa),
+   * 2 = eskalacja gdy codzienne trasy nie pokryją miesiąca (Warszawa),
+   * 3 = sporadyczne lokalne (hurtownie/banki),
+   * 4 = rzadkie dalekie (LR/Nerta) — dobierane na samym końcu.
+   */
+  tier: 1 | 2 | 3 | 4;
 }
 
 export interface GeneratedTripDraft {
@@ -41,6 +46,11 @@ export interface AutoFillResult {
 
 const KM_SCALE = 10; // internal integer arithmetic in tenths of a km, avoids float drift
 
+/** Trasy dłuższe niż to (w jedną stronę) traktowane są jako "dalekie wyjazdy" — wymagają odstępu między sobą. */
+const LONG_TRIP_KM_THRESHOLD = 50;
+/** Minimalny odstęp kalendarzowy między dwoma dalekimi wyjazdami — nierealne robić Warszawę/Nertę/LR co drugi dzień. */
+const LONG_TRIP_MIN_GAP_DAYS = 7;
+
 function toTenths(km: number): number {
   return Math.round(km * KM_SCALE);
 }
@@ -51,6 +61,12 @@ function fromTenths(tenths: number): number {
 
 function toIsoDate(d: Date): string {
   return d.toISOString().slice(0, 10);
+}
+
+function daysBetween(aIso: string, bIso: string): number {
+  const a = new Date(`${aIso}T00:00:00Z`).getTime();
+  const b = new Date(`${bIso}T00:00:00Z`).getTime();
+  return Math.abs(a - b) / 86_400_000;
 }
 
 /** workdaysOnly=true wyklucza tylko niedzielę (pon-sob to dni z dojazdami) — zgodnie z realnym wzorcem QLIFE. */
@@ -108,9 +124,15 @@ interface DayConstraint {
   cap: number;
 }
 
-function findDayWithCapacity(dayPool: string[], constraints: DayConstraint[], startCursor: number): string | null {
+function findDayWithCapacity(
+  dayPool: string[],
+  constraints: DayConstraint[],
+  extraFilter: ((day: string) => boolean) | null,
+  startCursor: number,
+): string | null {
   for (let i = 0; i < dayPool.length; i++) {
     const day = dayPool[(startCursor + i) % dayPool.length];
+    if (extraFilter && !extraFilter(day)) continue;
     if (constraints.every((c) => (c.counts.get(day) ?? 0) < c.cap)) return day;
   }
   return null;
@@ -121,14 +143,17 @@ interface FillState {
   remainingTenths: number;
   overallCounts: Map<string, number>;
   tier1Counts: Map<string, number>;
-  dayCursor: number;
+  /** Data ostatniego zaplanowanego dalekiego wyjazdu (Warszawa/LR/Nerta) — wymuszamy odstęp od niej. */
+  lastLongTripDate: string | null;
 }
 
 /**
  * Wypełnia jedną warstwę priorytetu aż zabraknie miejsca w dniach albo reszta będzie za mała.
  * Warstwa 1 (codzienne dojazdy myjnia/budowa) jest dodatkowo ograniczona do jednego przejazdu
  * dziennie — inaczej sama zajęłaby wszystkie dostępne "sloty" w dniach, nie zostawiając miejsca
- * na eskalację do Warszawy/hurtowni gdy cel jest duży.
+ * na eskalację do Warszawy/hurtowni gdy cel jest duży. Warstwy z dalekimi trasami (>50 km w jedną
+ * stronę) dodatkowo wymagają co najmniej tygodnia odstępu od poprzedniego dalekiego wyjazdu — i
+ * rezerwują cały dzień wyłącznie dla siebie, żeby nie mieszać dalekiej podróży z lokalnymi sprawami.
  */
 function fillTier(
   state: FillState,
@@ -137,16 +162,23 @@ function fillTier(
   baseName: string,
   maxTripsPerDay: number,
   isDailyTier: boolean,
+  tier1RouteNames: Set<string>,
   rng: () => number,
 ): void {
   if (tierRoutes.length === 0 || dayPool.length === 0) return;
 
+  const isLongTier = tierRoutes.some((r) => r.oneWayKm > LONG_TRIP_KM_THRESHOLD);
   const constraints: DayConstraint[] = [{ counts: state.overallCounts, cap: maxTripsPerDay }];
   if (isDailyTier) constraints.push({ counts: state.tier1Counts, cap: 1 });
+
+  const longTripFilter = isLongTier
+    ? (day: string) => !state.lastLongTripDate || daysBetween(day, state.lastLongTripDate) >= LONG_TRIP_MIN_GAP_DAYS
+    : null;
 
   const smallestPairTenths = Math.min(...tierRoutes.map((r) => toTenths(r.oneWayKm) * 2));
   const guardLimit = dayPool.length * maxTripsPerDay + 200;
   let guard = 0;
+  let dayCursor = 0;
 
   while (state.remainingTenths >= smallestPairTenths && guard < guardLimit) {
     guard += 1;
@@ -154,12 +186,29 @@ function fillTier(
     const pairTenths = toTenths(route.oneWayKm) * 2;
     if (pairTenths > state.remainingTenths) continue;
 
-    const day = findDayWithCapacity(dayPool, constraints, state.dayCursor);
-    if (!day) break; // wszystkie dni w tej warstwie osiągnęły limit — przejdź do kolejnej warstwy
-    state.dayCursor = (dayPool.indexOf(day) + 1) % dayPool.length;
+    const day = findDayWithCapacity(dayPool, constraints, longTripFilter, dayCursor);
+    if (!day) break; // wszystkie dni w tej warstwie osiągnęły limit (lub odstęp od dalekiego wyjazdu) — kolejna warstwa
+    dayCursor = (dayPool.indexOf(day) + 1) % dayPool.length;
+
+    if (isLongTier && (state.tier1Counts.get(day) ?? 0) > 0) {
+      // Warstwa 1 już zajęła ten dzień lokalnym wyjazdem — daleki wyjazd go przejmuje,
+      // żeby nie mieszać podróży do Warszawy/LR/Nerty z dojazdem do myjni tego samego dnia.
+      // Zwracamy km usuniętych wpisów do puli, żeby suma nadal zgadzała się z celem.
+      const evicted = state.trips.filter(
+        (t) => t.data === day && (tier1RouteNames.has(t.dokad) || tier1RouteNames.has(t.skad)),
+      );
+      state.trips = state.trips.filter((t) => !evicted.includes(t));
+      state.remainingTenths += evicted.reduce((sum, t) => sum + toTenths(t.km), 0);
+      state.tier1Counts.set(day, 0);
+      state.overallCounts.set(day, (state.overallCounts.get(day) ?? 0) - evicted.length);
+    }
 
     state.overallCounts.set(day, (state.overallCounts.get(day) ?? 0) + 1);
     if (isDailyTier) state.tier1Counts.set(day, (state.tier1Counts.get(day) ?? 0) + 1);
+    if (isLongTier) {
+      state.lastLongTripDate = day;
+      state.overallCounts.set(day, maxTripsPerDay); // cały dzień zarezerwowany na daleki wyjazd
+    }
     state.trips.push({
       data: day,
       skad: baseName,
@@ -202,7 +251,7 @@ export function generateAutoTrips(input: AutoFillInput): AutoFillResult {
     remainingTenths: toTenths(targetKm),
     overallCounts: new Map(),
     tier1Counts: new Map(),
-    dayCursor: 0,
+    lastLongTripDate: null,
   };
   if (state.remainingTenths <= 0 || routes.length === 0) {
     return { trips: state.trips, unresolvedKm: fromTenths(Math.max(state.remainingTenths, 0)) };
@@ -219,10 +268,13 @@ export function generateAutoTrips(input: AutoFillInput): AutoFillResult {
   const tier1 = routes.filter((r) => r.tier === 1);
   const tier2 = routes.filter((r) => r.tier === 2);
   const tier3 = routes.filter((r) => r.tier === 3);
+  const tier4 = routes.filter((r) => r.tier === 4);
+  const tier1RouteNames = new Set(tier1.map((r) => r.nazwa));
 
-  fillTier(state, tier1, dayPool, baseName, maxTripsPerDay, true, rng);
-  fillTier(state, tier2, dayPool, baseName, maxTripsPerDay, false, rng);
-  fillTier(state, tier3, dayPool, baseName, maxTripsPerDay, false, rng);
+  fillTier(state, tier1, dayPool, baseName, maxTripsPerDay, true, tier1RouteNames, rng);
+  fillTier(state, tier2, dayPool, baseName, maxTripsPerDay, false, tier1RouteNames, rng);
+  fillTier(state, tier3, dayPool, baseName, maxTripsPerDay, false, tier1RouteNames, rng);
+  fillTier(state, tier4, dayPool, baseName, maxTripsPerDay, false, tier1RouteNames, rng);
 
   if (state.remainingTenths > 0) {
     const legsTenths = routes.map((r) => toTenths(r.oneWayKm));
